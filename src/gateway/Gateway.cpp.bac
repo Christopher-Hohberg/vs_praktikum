@@ -1,0 +1,262 @@
+/*
+ * Gateway.cpp
+ *
+ *  Created on: May 2, 2022
+ *      Author: fbellmann
+ */
+#include <iostream>
+#include <unistd.h>
+#include <string>
+#include <thread>
+#include <time.h>
+#include <random>
+#include <iomanip>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <boost/asio.hpp>
+#include <vector>
+#include <chrono>
+#include <map>
+#include <semaphore.h>
+#include <mutex>
+
+using boost::asio::ip::udp;
+using std::string;
+using std::cout;
+using std::cerr;
+using std::runtime_error;
+using std::exception;
+using std::thread;
+using std::setprecision;
+using std::vector;
+using std::begin;
+using std::end;
+using namespace std::chrono;
+using std::map;
+using std::to_string;
+using std::mutex;
+
+struct SensorData {
+	double temperature = {};
+	double brightness = {};
+	double humidity = {};
+};
+
+struct SensorUDPReply {
+	long int id = {};
+	int port = {};
+	string ip = {};
+	long int timestamp = {};
+	SensorData sensorData = {};
+	int errorCode = {};
+};
+
+// global variables
+SensorData* sensorData = new SensorData{};
+vector<string>* sensorSocketIPs = new vector<string>{"10.5.0.5","10.5.0.7"};
+// the two maps will have the key like IP:Port to differentiate between the sensors
+// the sensors will reply their ip address and port within the udp packet
+map<string, sem_t*> semSensors = {};
+map<string, long int[2]> sentUDPRequests = {}; // first value of the long int array holds the requestID, second the request timestamp
+mutex* mtxSentUDPRequests = new mutex();
+const int REQUEST_TIME = 1000000;
+const int MAX_PACKET_SIZE = 4096;
+const int MAX_NUMBER_OF_RETRIES = 1;
+const int TIMEOUT_IN_SECONDS = 0.5;
+boost::asio::io_service io_service;
+udp::socket s(io_service, udp::endpoint(udp::v4(), 0));
+udp::resolver resolver(io_service);
+// nicht-funktionaler Test:
+mutex* mtxNumberOfLostPackets = new mutex();
+long int numberOfLostPackets = {};
+long int numberOfTotalPackets = {};
+
+// methods
+void simulateUDPSocket(string ip, string port);
+string generateRequest(long int requestID, string ip, string port, milliseconds timestamp);
+SensorUDPReply parseReply(char* data_);
+string convertToTwoDecimalPlaces(string number);
+void handleReply();
+
+int main(int argc, char* argv[])
+{
+	string port = "11000";
+
+	int threadID = {};
+	cout << "Spawning threads for:\n";
+	for(std::vector<string>::iterator socketIP = begin(*sensorSocketIPs); socketIP != end(*sensorSocketIPs); ++socketIP) {
+		// set up all the semaphores
+		sem_t* semSensor = new sem_t();
+		sem_init(semSensor, 0, 0);
+		string keyOfSensorMap = *socketIP + ":" + port;
+		semSensors[keyOfSensorMap] = semSensor;
+		sentUDPRequests[keyOfSensorMap][0] = 0;
+		sentUDPRequests[keyOfSensorMap][1] = 0;
+		++threadID;
+
+		// simulate all udp sockets to sensor
+		cout << *socketIP << ":" << port << "\n";;
+		thread sensorSocket(simulateUDPSocket, *socketIP, port);
+		sensorSocket.detach();
+	}
+
+	thread waitForAnswer(handleReply);
+	waitForAnswer.join();
+
+	s.close();
+}
+
+void simulateUDPSocket(string ip, string port) {
+	char ip_char[ip.length() + 1];
+	strcpy(ip_char, ip.c_str());
+	char port_char[port.length() + 1];
+	strcpy(port_char, port.c_str());
+
+	udp::resolver::query query(udp::v4(), ip_char, port_char);
+	udp::resolver::iterator iterator = resolver.resolve(query);
+
+	long int requestID = {0};
+	long int timestampOfLastRequest = {};
+	string keyOfSensorMap = ip + ":" + port;
+	struct timespec ts;
+	int returnCode = {};
+
+	while (true) {
+		for (int retryCount = {}; retryCount < MAX_NUMBER_OF_RETRIES; ++retryCount) {
+			milliseconds timestamp = duration_cast< milliseconds >(system_clock::now().time_since_epoch());
+			char request[MAX_PACKET_SIZE];
+			string req = generateRequest(requestID, ip, port, timestamp);
+			strcpy(request, req.c_str());
+			size_t request_length = strlen(request);
+			timestampOfLastRequest = stol(to_string(timestamp.count()));
+
+			mtxSentUDPRequests->lock();
+				sentUDPRequests[keyOfSensorMap][0] = requestID;
+				sentUDPRequests[keyOfSensorMap][1] = timestampOfLastRequest;
+			mtxSentUDPRequests->unlock();
+
+			// Nicht-Funktionaler Test:
+			mtxNumberOfLostPackets->lock();
+				++numberOfTotalPackets;
+	    		/*if (numberOfTotalPackets >= 10001) {
+	    			cout << "Number of Total Packets: " << numberOfTotalPackets - 1 << "\n";
+	    			cout << "Number of Lost Packets: " << numberOfLostPackets << "\n";
+	    			cout << "Number of Successful Packets: " << numberOfTotalPackets - 1 - numberOfLostPackets << "\n";
+	    			exit(0);
+	    		}*/
+			mtxNumberOfLostPackets->unlock();
+
+			s.send_to(boost::asio::buffer(request, request_length), *iterator);
+
+			// wait for the response
+		    if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
+		        perror("clock_gettime");
+		        exit(EXIT_FAILURE);
+		    }
+		    ts.tv_sec += TIMEOUT_IN_SECONDS;
+		    while ((returnCode = sem_timedwait((semSensors[keyOfSensorMap]), &ts)) == -1 && errno == EINTR)
+		        continue;
+		    if (returnCode == -1) { // if we weren't able to get the semaphore --> that means there came no answer from the sensor in time
+		        // we need to retry
+		    	if (errno == ETIMEDOUT) {
+		    		mtxSentUDPRequests->lock();
+		    			long int timeoutTime = (duration_cast< milliseconds >(system_clock::now().time_since_epoch())).count() - sentUDPRequests[keyOfSensorMap][1];
+		    		mtxSentUDPRequests->unlock();
+
+		    		mtxNumberOfLostPackets->lock();
+		    			++numberOfLostPackets;
+			    	mtxNumberOfLostPackets->unlock();
+		    		cout << "Reply " + to_string(requestID) + " from " + keyOfSensorMap + " timed out after " + to_string(timeoutTime) + " ms. Retry Count: " + to_string(retryCount) + "\n";
+		        } else {
+		            perror("sem_timedwait");
+		        }
+		    } else {
+		    	// sem_timedwait() succeeded, we've got the semaphore, so it came a reply in time
+		    	break; // break from loop to avoid retrying
+		    }
+		}
+		usleep(REQUEST_TIME); // sollte vielleicht nur gemacht werden, wenn es keinen Fehler gab
+		++requestID;
+	}
+}
+
+string generateRequest(long int requestID, string ip, string port, milliseconds timestamp) {
+	string req = std::to_string(requestID) + ";" + ip + ";" + port + ";" + std::to_string(timestamp.count()) + ";NULL";
+	return req;
+}
+
+SensorUDPReply parseReply(char* data_) {
+	SensorUDPReply parsedReply = {};
+	string reply = std::string(data_);
+
+	size_t last = 0;
+	size_t next = 0;
+	string delimiter = ";";
+	int index = {};
+	while ((next = reply.find(delimiter, last)) != string::npos) {
+		setprecision(2);
+		switch(index) {
+			case 0: parsedReply.id = stol(reply.substr(last, next-last));
+					break;
+			case 1: parsedReply.timestamp = stol(reply.substr(last, next-last));
+					break;
+			case 2: parsedReply.sensorData.brightness = stod(reply.substr(last, next-last));
+					break;
+			case 3: parsedReply.sensorData.humidity = stod(reply.substr(last, next-last));
+					break;
+			case 4: parsedReply.sensorData.temperature = stod(reply.substr(last, next-last));
+					break;
+			case 5: parsedReply.errorCode = stoi(reply.substr(last, next-last));
+					break;
+			case 6: parsedReply.ip = reply.substr(last, next-last); // needed to differentiate between the sensors
+					break;
+			case 7: parsedReply.port = stoi(reply.substr(last, next-last)); // needed to differentiate between the sensors
+					break;
+		}
+		++index;
+		last = next + 1;
+	}
+	return parsedReply;
+}
+
+void handleReply() {
+	while (true) {
+	    char reply[MAX_PACKET_SIZE];
+	    udp::endpoint sender_endpoint;
+	    size_t reply_length = s.receive_from(boost::asio::buffer(reply, MAX_PACKET_SIZE), sender_endpoint);
+	    /*std::cout << "Reply is: ";
+	    std::cout.write(reply, reply_length);
+	    std::cout << "\n";*/
+	    SensorUDPReply sensorUDPReply = parseReply(reply);
+	    string keyOfSensorMap = sensorUDPReply.ip + ":" + to_string(sensorUDPReply.port);
+
+	    // check if the id the expected id
+	    mtxSentUDPRequests->lock();
+	    	long int expectedID = sentUDPRequests[keyOfSensorMap][0];
+	    	long int timestampOfRequest = sentUDPRequests[keyOfSensorMap][1];
+	    mtxSentUDPRequests->unlock();
+	    if (expectedID == sensorUDPReply.id) {
+    		mtxSentUDPRequests->lock();
+    			long int amountOfMsItTookToGetTheReply = (duration_cast< milliseconds >(system_clock::now().time_since_epoch())).count() - timestampOfRequest;
+    		mtxSentUDPRequests->unlock();
+	    	// check if there is no error
+	    	if (sensorUDPReply.errorCode == 0) {
+	    		cout << "Request " + to_string(sensorUDPReply.id) + " returned from sensor " + keyOfSensorMap + " after " + to_string(amountOfMsItTookToGetTheReply) + " ms and gave the data:\n BRIGHT -> " + convertToTwoDecimalPlaces(to_string(sensorUDPReply.sensorData.brightness)) + " |  HUM -> " + convertToTwoDecimalPlaces(to_string(sensorUDPReply.sensorData.humidity)) + " | TEMP -> " + convertToTwoDecimalPlaces(to_string(sensorUDPReply.sensorData.temperature)) + "\n";
+	    		sem_post(semSensors[keyOfSensorMap]);
+	    	} else {
+	    		// at the point of writing there is only one case where an error code
+	    		// occurs: when the sensor has no new data generated. this case is not
+	    		// that important. we can just create a new request and try again.
+	    		cout << "Request " + to_string(sensorUDPReply.id) + " returned from sensor " + keyOfSensorMap + " with error " + to_string(sensorUDPReply.errorCode) + " after " + to_string(amountOfMsItTookToGetTheReply) + " ms\n";
+	    		sem_post(semSensors[keyOfSensorMap]);
+	    	}
+	    }
+	}
+}
+
+string convertToTwoDecimalPlaces(string number) {
+	string delimiter = ".";
+	number = number.substr(0, number.find(delimiter) + 1) + number.substr(number.find(delimiter) + 1, 2);
+	return number;
+}
